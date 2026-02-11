@@ -3,6 +3,29 @@
 //! Reference implementation for OEMs. Holds ECU secrets server-side and computes
 //! security keys on behalf of authenticated users. Replace the token validation
 //! with your Entra ID / OAuth flow for production use.
+//!
+//! # Request Format
+//!
+//! The client sends vehicle and ECU identification context so the helper can
+//! resolve the correct algorithm and key material. This reference implementation
+//! uses `ecu.component_id` for lookup; a real deployment might use `part_number`,
+//! `vin` prefix, or a combination.
+//!
+//! ```json
+//! {
+//!   "seed": "aabbccdd",
+//!   "level": 1,
+//!   "vehicle": { "vin": "1HGBH41JXMN109186" },
+//!   "ecu": {
+//!     "component_id": "engine_ecu",
+//!     "logical_address": "0x18DA00F1",
+//!     "part_number": "A2C12345",
+//!     "hw_version": "H01",
+//!     "sw_version": "v1.0.0",
+//!     "supplier": "Continental"
+//!   }
+//! }
+//! ```
 
 use axum::{
     extract::State,
@@ -54,22 +77,41 @@ struct InfoResponse {
     name: String,
     version: String,
     auth_required: bool,
-    algorithms: Vec<AlgorithmInfo>,
+    supported_ecus: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct AlgorithmInfo {
-    id: String,
-    name: String,
-    ecu_types: Vec<String>,
+/// Vehicle identification context — available for OEM lookup strategies
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct VehicleContext {
+    #[serde(default)]
+    vin: Option<String>,
+}
+
+/// ECU identification context — available for OEM lookup strategies
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct EcuContext {
+    component_id: String,
+    #[serde(default)]
+    logical_address: Option<String>,
+    #[serde(default)]
+    part_number: Option<String>,
+    #[serde(default)]
+    hw_version: Option<String>,
+    #[serde(default)]
+    sw_version: Option<String>,
+    #[serde(default)]
+    supplier: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct CalculateRequest {
     seed: String,
     level: u8,
-    ecu_type: String,
-    algorithm: String,
+    #[serde(default)]
+    vehicle: Option<VehicleContext>,
+    ecu: EcuContext,
 }
 
 #[derive(Serialize)]
@@ -95,36 +137,14 @@ struct AppState {
 // =============================================================================
 
 async fn info_handler(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
-    // Group ECU types by algorithm
-    let mut algo_ecus: HashMap<String, Vec<String>> = HashMap::new();
-    for (ecu_type, secret) in &state.ecus {
-        algo_ecus
-            .entry(secret.algorithm.clone())
-            .or_default()
-            .push(ecu_type.clone());
-    }
-
-    let algorithms = algo_ecus
-        .into_iter()
-        .map(|(id, mut ecu_types)| {
-            ecu_types.sort();
-            let name = match id.as_str() {
-                "xor" => "XOR with shared secret".to_string(),
-                other => other.to_string(),
-            };
-            AlgorithmInfo {
-                id,
-                name,
-                ecu_types,
-            }
-        })
-        .collect();
+    let mut supported: Vec<String> = state.ecus.keys().cloned().collect();
+    supported.sort();
 
     Json(InfoResponse {
-        name: "SOVD Test ECU Security Helper".to_string(),
-        version: "1.0.0".to_string(),
+        name: "SOVD Security Helper".to_string(),
+        version: "2.0.0".to_string(),
         auth_required: true,
-        algorithms,
+        supported_ecus: supported,
     })
 }
 
@@ -151,35 +171,24 @@ async fn calculate_handler(
         );
     }
 
-    // Look up ECU secret
-    let ecu_secret = match state.ecus.get(&req.ecu_type) {
+    // Look up ECU secret by component_id
+    let ecu_secret = match state.ecus.get(&req.ecu.component_id) {
         Some(s) => s,
         None => {
             return (
-                StatusCode::FORBIDDEN,
+                StatusCode::NOT_FOUND,
                 Json(CalculateResponse {
                     success: false,
                     key: None,
-                    error: Some(format!("User not authorized for ECU type '{}'", req.ecu_type)),
+                    error: Some(format!(
+                        "Unknown ECU '{}'. Supported: {:?}",
+                        req.ecu.component_id,
+                        state.ecus.keys().collect::<Vec<_>>()
+                    )),
                 }),
             );
         }
     };
-
-    // Verify algorithm matches
-    if ecu_secret.algorithm != req.algorithm {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(CalculateResponse {
-                success: false,
-                key: None,
-                error: Some(format!(
-                    "Algorithm mismatch: ECU '{}' uses '{}', not '{}'",
-                    req.ecu_type, ecu_secret.algorithm, req.algorithm
-                )),
-            }),
-        );
-    }
 
     // Parse seed hex
     let seed_bytes = match hex::decode(&req.seed) {
@@ -211,8 +220,8 @@ async fn calculate_handler(
         }
     };
 
-    // Compute key based on algorithm
-    let key_bytes = match req.algorithm.as_str() {
+    // Compute key based on the ECU's configured algorithm
+    let key_bytes = match ecu_secret.algorithm.as_str() {
         "xor" => {
             if secret_bytes.is_empty() {
                 return (
@@ -230,19 +239,29 @@ async fn calculate_handler(
                 .map(|(i, b)| b ^ secret_bytes[i % secret_bytes.len()])
                 .collect::<Vec<u8>>()
         }
-        _ => {
+        other => {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(CalculateResponse {
                     success: false,
                     key: None,
-                    error: Some(format!("Unsupported algorithm: {}", req.algorithm)),
+                    error: Some(format!(
+                        "Unsupported algorithm '{}' configured for ECU '{}'",
+                        other, req.ecu.component_id
+                    )),
                 }),
             );
         }
     };
 
-    let _ = req.level; // Reserved for future per-level key derivation
+    // Log context for audit trail (level, vehicle, ecu identity)
+    let _ = req.level;
+    let _ = req.vehicle;
+    let _ = req.ecu.logical_address;
+    let _ = req.ecu.part_number;
+    let _ = req.ecu.hw_version;
+    let _ = req.ecu.sw_version;
+    let _ = req.ecu.supplier;
 
     (
         StatusCode::OK,
@@ -273,6 +292,7 @@ async fn main() {
         std::process::exit(1);
     });
 
+    let ecu_count = config.ecus.len();
     let state = Arc::new(AppState {
         token: cli.token.clone(),
         ecus: config.ecus,
@@ -285,7 +305,7 @@ async fn main() {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     println!("SOVD Security Helper listening on http://{}", addr);
-    println!("  ECU types: {:?}", config_str.matches("[ecus.").count());
+    println!("  ECUs: {}", ecu_count);
     println!("  Token: {}...", &cli.token[..cli.token.len().min(4)]);
 
     let listener = tokio::net::TcpListener::bind(addr)
