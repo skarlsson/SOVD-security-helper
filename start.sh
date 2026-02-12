@@ -17,6 +17,7 @@ BIN="$SCRIPT_DIR/target/debug/sovd-security-helper"
 
 # Defaults
 PORT="${PORT:-9100}"
+# TOKEN="${SOVD_HELPER_TOKEN:-}"              # uncomment for OIDC (config-driven auth)
 TOKEN="${SOVD_HELPER_TOKEN:-dev-secret-123}"
 CONFIG="$SCRIPT_DIR/config/secrets.toml"
 
@@ -91,7 +92,11 @@ trap cleanup SIGINT SIGTERM EXIT
 
 # -- Start --------------------------------------------------------------------
 info "Starting SOVD Security Helper on port $PORT..."
-"$BIN" --port "$PORT" --token "$TOKEN" --config "$CONFIG" \
+HELPER_ARGS=(--port "$PORT" --config "$CONFIG")
+if [[ -n "$TOKEN" ]]; then
+    HELPER_ARGS+=(--token "$TOKEN")
+fi
+"$BIN" "${HELPER_ARGS[@]}" \
     > "$LOG_DIR/helper.log" 2>&1 &
 HELPER_PID=$!
 
@@ -112,16 +117,23 @@ echo -e "${_GREEN}Security Helper Running${_NC}"
 echo "=============================================="
 echo ""
 echo "  URL:    http://localhost:$PORT"
+if [[ -n "$TOKEN" ]]; then
 echo "  Token:  ${TOKEN:0:4}..."
+echo "  Auth:   static mode (--token override)"
+else
+echo "  Auth:   config-driven (see $CONFIG)"
+fi
 echo "  Config: $CONFIG"
 echo "  PID:    $HELPER_PID"
 echo ""
 echo "  Test:"
 echo "    curl http://localhost:$PORT/info"
+if [[ -n "$TOKEN" ]]; then
 echo "    curl -X POST http://localhost:$PORT/calculate \\"
 echo "      -H 'Authorization: Bearer $TOKEN' \\"
 echo "      -H 'Content-Type: application/json' \\"
-echo "      -d '{\"seed\":\"aabbccdd\",\"level\":1,\"ecu\":{\"component_id\":\"engine_ecu\"}}'"
+echo "      -d '{\"seed\":\"aabbccdd\",\"level\":1,\"ecu\":{\"component_id\":\"engine\"}}'"
+fi
 echo ""
 echo "  Logs: $LOG_DIR/helper.log"
 echo ""
